@@ -211,6 +211,8 @@ Response: `{ access_token, refresh_token, expires_in (seconds), scope }`.
   without notice and it may stop working.
 - The authorization flow uses Claude Code's public OAuth client identifier;
   Anthropic does not document this as a supported third-party integration.
+- The Claude Code-compatible user agent is a deliberate protocol compatibility
+  decision; see [Compatibility decisions](docs/compatibility-decisions.md).
 - Use only with your own account/credentials.
 - The endpoint reflects subscription rate-limit windows; the dollar/overage
   fields apply only if you've enabled pay-as-you-go usage.
