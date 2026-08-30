@@ -58,6 +58,8 @@ interface OAuth {
 }
 interface CredBlob { claudeAiOauth: OAuth }
 
+class InvalidCredentialsError extends Error {}
+
 const configDir = process.env.CLAUDE_QUOTA_CONFIG_DIR
   ?? (process.env.XDG_CONFIG_HOME
     ? join(process.env.XDG_CONFIG_HOME, "claude-quota")
@@ -67,7 +69,33 @@ const lockPath = join(configDir, "credentials.lock");
 
 // ---- Credential storage (read/write) ---------------------------------------
 async function readCreds(): Promise<CredBlob> {
-  return JSON.parse(await readFile(credPath, "utf8"));
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(credPath, "utf8"));
+  } catch (err) {
+    const fileError = err as { code?: string };
+    if (fileError.code === "ENOENT") throw err;
+    throw new InvalidCredentialsError("Stored credentials are not valid JSON.");
+  }
+  if (!isCredBlob(value)) {
+    throw new InvalidCredentialsError("Stored credentials have an invalid shape.");
+  }
+  return value;
+}
+
+function isCredBlob(value: unknown): value is CredBlob {
+  if (!value || typeof value !== "object") return false;
+  const oauth = (value as { claudeAiOauth?: unknown }).claudeAiOauth;
+  if (!oauth || typeof oauth !== "object") return false;
+  const candidate = oauth as Partial<OAuth>;
+  return (
+    typeof candidate.accessToken === "string" && candidate.accessToken.length > 0 &&
+    typeof candidate.refreshToken === "string" && candidate.refreshToken.length > 0 &&
+    typeof candidate.expiresAt === "number" && Number.isFinite(candidate.expiresAt) &&
+    candidate.expiresAt > 0 &&
+    Array.isArray(candidate.scopes) &&
+    candidate.scopes.every((scope) => typeof scope === "string")
+  );
 }
 
 async function writeCreds(blob: CredBlob): Promise<void> {
@@ -188,8 +216,12 @@ async function authorize(): Promise<OAuth> {
     subscription_type?: string;
     rate_limit_tier?: string;
   };
-  if (!t.access_token || !t.refresh_token) {
-    throw new Error("Authorization response did not include access and refresh tokens.");
+  if (
+    typeof t.access_token !== "string" || !t.access_token ||
+    typeof t.refresh_token !== "string" || !t.refresh_token ||
+    typeof t.expires_in !== "number" || !Number.isFinite(t.expires_in) || t.expires_in <= 0
+  ) {
+    throw new Error("Authorization response did not include valid OAuth tokens and expiry.");
   }
   const oauth: OAuth = {
     accessToken: t.access_token,
@@ -230,6 +262,13 @@ async function refresh(blob: CredBlob): Promise<OAuth> {
     expires_in: number; // seconds
     scope?: string;
   };
+  if (
+    typeof t.access_token !== "string" || !t.access_token ||
+    typeof t.expires_in !== "number" || !Number.isFinite(t.expires_in) || t.expires_in <= 0 ||
+    (t.refresh_token !== undefined && typeof t.refresh_token !== "string")
+  ) {
+    throw new Error("Token refresh response did not include a valid access token and expiry.");
+  }
   const updated: OAuth = {
     ...blob.claudeAiOauth,
     accessToken: t.access_token,
@@ -249,7 +288,10 @@ async function getValidToken(forceLogin = false): Promise<OAuth> {
     blob = await readCreds();
   } catch (err) {
     const missing = err as { code?: string };
-    if (missing.code !== "ENOENT") throw err;
+    if (missing.code !== "ENOENT" && !(err instanceof InvalidCredentialsError)) throw err;
+    if (err instanceof InvalidCredentialsError) {
+      process.stderr.write(`• ${err.message} Authorizing again…\n`);
+    }
     return authorize();
   }
   const oauth = blob.claudeAiOauth;
