@@ -606,7 +606,6 @@ async function main() {
 
   console.log("\n  Claude Code quota");
   console.log(`  Current Time: ${localTime()}`);
-  console.log(`  plan: ${oauth.subscriptionType ?? "?"} (${oauth.rateLimitTier ?? "?"})`);
   console.log("  " + "─".repeat(70));
   console.log("  " + line("5-hour session", usage.five_hour));
   console.log("  " + line("7-day (all)", usage.seven_day));
