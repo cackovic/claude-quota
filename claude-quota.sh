@@ -24,6 +24,7 @@ SCOPES="user:inference user:profile user:sessions:claude_code user:mcp_servers u
 UA="claude-cli/2.1.185 (external, cli)"
 CONFIG_DIR="${CLAUDE_QUOTA_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-quota}"
 CRED_FILE="$CONFIG_DIR/credentials.json"
+LOCK_DIR="$CONFIG_DIR/credentials.lock"
 REFRESH_SKEW_MS=60000   # refresh if it expires within a minute
 
 die() { echo "Error: $*" >&2; exit 1; }
@@ -43,12 +44,41 @@ read_blob() {
   cat "$CRED_FILE"
 }
 
+acquire_lock() {
+  local attempt owner
+  mkdir -p -m 700 "$CONFIG_DIR"
+  for (( attempt=0; attempt<100; attempt++ )); do
+    if mkdir -m 700 "$LOCK_DIR" 2>/dev/null; then
+      printf '%s' "$$" > "$LOCK_DIR/pid"
+      return
+    fi
+    if [[ -r "$LOCK_DIR/pid" ]]; then
+      IFS= read -r owner < "$LOCK_DIR/pid" || owner=""
+      if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+        rm -f "$LOCK_DIR/pid"
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        continue
+      fi
+    fi
+    sleep 0.1
+  done
+  die "timed out waiting for the credential lock"
+}
+
+release_lock() {
+  rm -f "$LOCK_DIR/pid"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
 write_blob() {  # $1 = full JSON blob
+  local temp_file
   mkdir -p -m 700 "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
   umask 177
-  printf '%s' "$1" > "$CRED_FILE"
-  chmod 600 "$CRED_FILE"
+  temp_file="$(mktemp "$CONFIG_DIR/.credentials.json.XXXXXX")"
+  printf '%s' "$1" > "$temp_file"
+  chmod 600 "$temp_file"
+  mv -f "$temp_file" "$CRED_FILE"
 }
 
 # ---- independent OAuth authorization (authorization code + PKCE) ----------
@@ -117,6 +147,8 @@ authorize() {
 # ---- get a valid access token (refresh if needed) --------------------------
 get_token() {
   local blob exp now_ms
+  acquire_lock
+  trap release_lock EXIT
   if [[ "$mode" == "--login" ]]; then
     authorize
     return

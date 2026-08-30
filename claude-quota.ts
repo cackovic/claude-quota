@@ -25,7 +25,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -63,6 +63,7 @@ const configDir = process.env.CLAUDE_QUOTA_CONFIG_DIR
     ? join(process.env.XDG_CONFIG_HOME, "claude-quota")
     : join(homedir(), ".config", "claude-quota"));
 const credPath = join(configDir, "credentials.json");
+const lockPath = join(configDir, "credentials.lock");
 
 // ---- Credential storage (read/write) ---------------------------------------
 async function readCreds(): Promise<CredBlob> {
@@ -72,7 +73,54 @@ async function readCreds(): Promise<CredBlob> {
 async function writeCreds(blob: CredBlob): Promise<void> {
   const json = JSON.stringify(blob);
   await mkdir(configDir, { recursive: true, mode: 0o700 });
-  await writeFile(credPath, json, { mode: 0o600 });
+  const tempPath = join(
+    configDir,
+    `.credentials.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
+  );
+  const file = await open(tempPath, "wx", 0o600);
+  try {
+    await file.writeFile(json, "utf8");
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+  try {
+    await rename(tempPath, credPath);
+  } catch (err) {
+    await unlink(tempPath).catch(() => undefined);
+    throw err;
+  }
+}
+
+async function withCredentialLock<T>(fn: () => Promise<T>): Promise<T> {
+  await mkdir(configDir, { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      const lock = await open(lockPath, "wx", 0o600);
+      await lock.writeFile(String(process.pid), "utf8");
+      await lock.close();
+      try {
+        return await fn();
+      } finally {
+        await unlink(lockPath).catch(() => undefined);
+      }
+    } catch (err) {
+      const conflict = err as { code?: string };
+      if (conflict.code !== "EEXIST") throw err;
+      try {
+        const owner = Number.parseInt(await readFile(lockPath, "utf8"), 10);
+        if (Number.isInteger(owner)) process.kill(owner, 0);
+      } catch (ownerError) {
+        const missingOwner = ownerError as { code?: string };
+        if (missingOwner.code === "ESRCH") {
+          await unlink(lockPath).catch(() => undefined);
+          continue;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  throw new Error("Timed out waiting for the credential lock.");
 }
 
 function base64url(bytes: Uint8Array): string {
@@ -288,7 +336,9 @@ function line(label: string, w: Window | null): string {
 // ---- Main -------------------------------------------------------------------
 async function main() {
   const wantJson = process.argv.includes("--json");
-  const oauth = await getValidToken(process.argv.includes("--login"));
+  const oauth = await withCredentialLock(() =>
+    getValidToken(process.argv.includes("--login")),
+  );
   const usage = await fetchUsage(oauth.accessToken);
 
   if (wantJson) {
