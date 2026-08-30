@@ -25,7 +25,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -69,6 +69,12 @@ const lockPath = join(configDir, "credentials.lock");
 
 // ---- Credential storage (read/write) ---------------------------------------
 async function readCreds(): Promise<CredBlob> {
+  await chmod(configDir, 0o700).catch((err: { code?: string }) => {
+    if (err.code !== "ENOENT") throw err;
+  });
+  await chmod(credPath, 0o600).catch((err: { code?: string }) => {
+    if (err.code !== "ENOENT") throw err;
+  });
   let value: unknown;
   try {
     value = JSON.parse(await readFile(credPath, "utf8"));
@@ -101,6 +107,7 @@ function isCredBlob(value: unknown): value is CredBlob {
 async function writeCreds(blob: CredBlob): Promise<void> {
   const json = JSON.stringify(blob);
   await mkdir(configDir, { recursive: true, mode: 0o700 });
+  await chmod(configDir, 0o700);
   const tempPath = join(
     configDir,
     `.credentials.${process.pid}.${randomBytes(8).toString("hex")}.tmp`,
@@ -114,6 +121,7 @@ async function writeCreds(blob: CredBlob): Promise<void> {
   }
   try {
     await rename(tempPath, credPath);
+    await chmod(credPath, 0o600);
   } catch (err) {
     await unlink(tempPath).catch(() => undefined);
     throw err;
