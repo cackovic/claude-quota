@@ -259,3 +259,28 @@ test("validates usage responses and clamps formatting", async (t) => {
   assert.match(clamped.stdout, /5h:100% left \(n\/a\)/);
   assert.match(clamped.stdout, /7d:0% left/);
 });
+
+test("accepts omitted inactive per-model windows", async (t) => {
+  const configDir = await tempConfig();
+  await writeCredentials(configDir);
+  const api = await mockApi((request, response) => {
+    if (request.url === "/usage") {
+      json(response, 200, {
+        five_hour: usagePayload.five_hour,
+        seven_day: usagePayload.seven_day,
+        extra_usage: {
+          is_enabled: false,
+          monthly_limit: 100,
+          used_credits: 25,
+          utilization: null,
+          currency: "USD",
+        },
+      });
+    }
+  });
+  t.after(api.close);
+
+  const result = await runCli(configDir, api.baseUrl, ["--short"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /5h:75% left/);
+});

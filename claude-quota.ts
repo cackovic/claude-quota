@@ -394,7 +394,7 @@ interface UsageResponse {
     is_enabled: boolean;
     monthly_limit: number;
     used_credits: number;
-    utilization: number;
+    utilization: number | null;
     currency: string;
     disabled_reason?: string | null;
   } | null;
@@ -419,6 +419,10 @@ function isUsageWindow(value: unknown): value is Window | null {
   );
 }
 
+function isOptionalUsageWindow(value: unknown): value is Window | null | undefined {
+  return value === undefined || isUsageWindow(value);
+}
+
 function parseUsage(value: unknown): UsageResponse {
   if (!value || typeof value !== "object") {
     throw new Error("Usage response has an invalid shape.");
@@ -427,13 +431,17 @@ function parseUsage(value: unknown): UsageResponse {
   if (
     !("five_hour" in usage) || !isUsageWindow(usage.five_hour) ||
     !("seven_day" in usage) || !isUsageWindow(usage.seven_day) ||
-    !("seven_day_opus" in usage) || !isUsageWindow(usage.seven_day_opus) ||
-    !("seven_day_sonnet" in usage) || !isUsageWindow(usage.seven_day_sonnet) ||
+    !isOptionalUsageWindow(usage.seven_day_opus) ||
+    !isOptionalUsageWindow(usage.seven_day_sonnet) ||
     !isExtraUsage(usage.extra_usage)
   ) {
     throw new Error("Usage response has an invalid shape.");
   }
-  return usage as UsageResponse;
+  return {
+    ...usage,
+    seven_day_opus: usage.seven_day_opus ?? null,
+    seven_day_sonnet: usage.seven_day_sonnet ?? null,
+  } as UsageResponse;
 }
 
 function isExtraUsage(value: UsageResponse["extra_usage"] | unknown): boolean {
@@ -444,7 +452,8 @@ function isExtraUsage(value: UsageResponse["extra_usage"] | unknown): boolean {
     typeof candidate.is_enabled === "boolean" &&
     typeof candidate.monthly_limit === "number" && Number.isFinite(candidate.monthly_limit) &&
     typeof candidate.used_credits === "number" && Number.isFinite(candidate.used_credits) &&
-    typeof candidate.utilization === "number" && Number.isFinite(candidate.utilization) &&
+    (candidate.utilization === null ||
+      (typeof candidate.utilization === "number" && Number.isFinite(candidate.utilization))) &&
     typeof candidate.currency === "string"
   );
 }
@@ -606,7 +615,9 @@ async function main() {
 
   const ex = usage.extra_usage;
   if (ex && ex.monthly_limit > 0) {
-    const utilization = clampPercent(ex.utilization);
+    const utilization = clampPercent(
+      ex.utilization ?? (ex.used_credits / ex.monthly_limit) * 100,
+    );
     const left = 100 - utilization;
     console.log("  " + "─".repeat(70));
     console.log(
