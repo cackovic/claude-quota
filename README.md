@@ -73,6 +73,7 @@ claude-quota --login    # authorize this app with Claude (also happens on first 
 claude-quota            # full readable report
 claude-quota --short    # one line: 5h:83% left (2h21m)  ·  7d:85% left (3d10h)  ·  now 11:07 pm
 claude-quota --json     # raw API payload (for scripting)
+claude-quota --help     # show all supported arguments
 ```
 
 `claude-quota.ts` is the canonical implementation. `claude-quota.sh` is a small
@@ -81,6 +82,8 @@ arguments, so both entry points always have identical behavior.
 
 Works on macOS and Linux/WSL. Authorization requires an interactive terminal
 once; subsequent quota checks and token refreshes are non-interactive.
+Network requests time out after 15 seconds by default. Set
+`CLAUDE_QUOTA_TIMEOUT_MS` to a positive millisecond value to override it.
 
 ---
 

@@ -50,7 +50,7 @@ function json(response, status, value) {
   response.end(JSON.stringify(value));
 }
 
-async function runCli(configDir, baseUrl, args = []) {
+async function runCli(configDir, baseUrl, args = [], env = {}) {
   const child = spawn(
     process.execPath,
     ["--import", "tsx", cliPath, ...args],
@@ -61,6 +61,7 @@ async function runCli(configDir, baseUrl, args = []) {
         CLAUDE_QUOTA_CONFIG_DIR: configDir,
         CLAUDE_QUOTA_USAGE_URL: `${baseUrl}/usage`,
         CLAUDE_QUOTA_TOKEN_URL: `${baseUrl}/token`,
+        ...env,
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -184,4 +185,77 @@ test("rejects malformed stored credentials before making requests", async () => 
   assert.equal(result.code, 1);
   assert.match(result.stderr, /Stored credentials are not valid JSON/);
   assert.match(result.stderr, /requires an interactive terminal/);
+});
+
+test("rejects unknown and conflicting arguments before reading credentials", async () => {
+  const configDir = await tempConfig();
+  const unknown = await runCli(configDir, "http://127.0.0.1:1", ["--bogus"]);
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.stderr, /Unknown argument: --bogus/);
+  assert.doesNotMatch(unknown.stderr, /authorization requires/);
+
+  const conflicting = await runCli(configDir, "http://127.0.0.1:1", ["--short", "--json"]);
+  assert.equal(conflicting.code, 1);
+  assert.match(conflicting.stderr, /Output modes cannot be combined/);
+});
+
+test("reports rate limits with retry guidance", async (t) => {
+  const configDir = await tempConfig();
+  await writeCredentials(configDir);
+  const api = await mockApi((request, response) => {
+    if (request.url === "/usage") {
+      response.writeHead(429, { "content-type": "application/json", "retry-after": "12" });
+      response.end(JSON.stringify({ error: { message: "slow down" } }));
+    }
+  });
+  t.after(api.close);
+
+  const result = await runCli(configDir, api.baseUrl, ["--short"]);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Usage request rate limited: HTTP 429; retry after 12: slow down/);
+});
+
+test("times out stalled usage requests", async (t) => {
+  const configDir = await tempConfig();
+  await writeCredentials(configDir);
+  const api = await mockApi(() => {});
+  t.after(api.close);
+
+  const result = await runCli(
+    configDir,
+    api.baseUrl,
+    ["--short"],
+    { CLAUDE_QUOTA_TIMEOUT_MS: "50" },
+  );
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Usage request timed out after 50ms/);
+});
+
+test("validates usage responses and clamps formatting", async (t) => {
+  const configDir = await tempConfig();
+  await writeCredentials(configDir);
+  let validShape = false;
+  const api = await mockApi((request, response) => {
+    if (request.url !== "/usage") return;
+    if (!validShape) {
+      json(response, 200, { five_hour: { utilization: "25", resets_at: null } });
+      return;
+    }
+    json(response, 200, {
+      ...usagePayload,
+      five_hour: { utilization: -5, resets_at: "not-a-date" },
+      seven_day: { utilization: 140, resets_at: null },
+    });
+  });
+  t.after(api.close);
+
+  const invalid = await runCli(configDir, api.baseUrl, ["--short"]);
+  assert.equal(invalid.code, 1);
+  assert.match(invalid.stderr, /Usage response has an invalid shape/);
+
+  validShape = true;
+  const clamped = await runCli(configDir, api.baseUrl, ["--short"]);
+  assert.equal(clamped.code, 0, clamped.stderr);
+  assert.match(clamped.stdout, /5h:100% left \(n\/a\)/);
+  assert.match(clamped.stdout, /7d:0% left/);
 });

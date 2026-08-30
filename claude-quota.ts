@@ -49,6 +49,75 @@ const SCOPES = [
 ];
 const USER_AGENT = "claude-cli/2.1.185 (external, cli)";
 const REFRESH_SKEW_MS = 60_000; // refresh if it expires within a minute
+const configuredTimeout = Number(process.env.CLAUDE_QUOTA_TIMEOUT_MS ?? "15000");
+const REQUEST_TIMEOUT_MS = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+  ? configuredTimeout
+  : 15_000;
+
+class HttpResponseError extends Error {
+  constructor(
+    readonly context: string,
+    readonly status: number,
+    readonly retryAfter: string | null,
+    detail: string,
+  ) {
+    const category = status === 429
+      ? "rate limited"
+      : status >= 500
+      ? "service error"
+      : "failed";
+    const retry = retryAfter ? `; retry after ${retryAfter}` : "";
+    super(`${context} ${category}: HTTP ${status}${retry}${detail ? `: ${detail}` : ""}`);
+  }
+}
+
+async function request(
+  context: string,
+  url: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    if ((err as { name?: string }).name === "TimeoutError") {
+      throw new Error(`${context} timed out after ${REQUEST_TIMEOUT_MS}ms.`);
+    }
+    throw new Error(`${context} network failure: ${(err as Error).message}`);
+  }
+}
+
+function responseDetail(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { error?: { message?: unknown } };
+    if (typeof parsed.error?.message === "string") return parsed.error.message;
+  } catch {
+    // Fall through to a bounded plain-text detail.
+  }
+  return body.replace(/\s+/g, " ").trim().slice(0, 300);
+}
+
+async function requireOk(context: string, response: Response): Promise<Response> {
+  if (response.ok) return response;
+  const body = await response.text();
+  throw new HttpResponseError(
+    context,
+    response.status,
+    response.headers.get("retry-after"),
+    responseDetail(body),
+  );
+}
+
+async function parseJsonResponse(context: string, response: Response): Promise<unknown> {
+  const body = await response.text();
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new Error(`${context} returned malformed JSON.`);
+  }
+}
 
 // ---- Credential types -------------------------------------------------------
 interface OAuth {
@@ -200,7 +269,7 @@ async function authorize(): Promise<OAuth> {
     throw new Error("Authorization state mismatch; refusing to exchange the code.");
   }
 
-  const res = await fetch(TOKEN_URL, {
+  const res = await request("Authorization", TOKEN_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -216,10 +285,8 @@ async function authorize(): Promise<OAuth> {
       code_verifier: verifier,
     }),
   });
-  if (!res.ok) {
-    throw new Error(`Authorization failed: HTTP ${res.status} ${await res.text()}`);
-  }
-  const t = (await res.json()) as {
+  await requireOk("Authorization", res);
+  const t = (await parseJsonResponse("Authorization", res)) as {
     access_token: string;
     refresh_token: string;
     expires_in: number;
@@ -249,7 +316,7 @@ async function authorize(): Promise<OAuth> {
 
 // ---- OAuth refresh ----------------------------------------------------------
 async function refresh(blob: CredBlob): Promise<OAuth> {
-  const res = await fetch(TOKEN_URL, {
+  const res = await request("Token refresh", TOKEN_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -262,12 +329,8 @@ async function refresh(blob: CredBlob): Promise<OAuth> {
       client_id: CLIENT_ID,
     }),
   });
-  if (!res.ok) {
-    throw new Error(
-      `Token refresh failed: HTTP ${res.status} ${await res.text()}`,
-    );
-  }
-  const t = (await res.json()) as {
+  await requireOk("Token refresh", res);
+  const t = (await parseJsonResponse("Token refresh", res)) as {
     access_token: string;
     refresh_token?: string;
     expires_in: number; // seconds
@@ -346,14 +409,48 @@ interface UsageResponse {
   [k: string]: unknown;
 }
 
-class UsageHttpError extends Error {
-  constructor(readonly status: number, body: string) {
-    super(`Usage fetch failed: HTTP ${status} ${body}`);
+function isUsageWindow(value: unknown): value is Window | null {
+  if (value === null) return true;
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<Window>;
+  return (
+    typeof candidate.utilization === "number" && Number.isFinite(candidate.utilization) &&
+    (candidate.resets_at === null || typeof candidate.resets_at === "string")
+  );
+}
+
+function parseUsage(value: unknown): UsageResponse {
+  if (!value || typeof value !== "object") {
+    throw new Error("Usage response has an invalid shape.");
   }
+  const usage = value as Partial<UsageResponse>;
+  if (
+    !("five_hour" in usage) || !isUsageWindow(usage.five_hour) ||
+    !("seven_day" in usage) || !isUsageWindow(usage.seven_day) ||
+    !("seven_day_opus" in usage) || !isUsageWindow(usage.seven_day_opus) ||
+    !("seven_day_sonnet" in usage) || !isUsageWindow(usage.seven_day_sonnet) ||
+    !isExtraUsage(usage.extra_usage)
+  ) {
+    throw new Error("Usage response has an invalid shape.");
+  }
+  return usage as UsageResponse;
+}
+
+function isExtraUsage(value: UsageResponse["extra_usage"] | unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (typeof value !== "object") return false;
+  const candidate = value as NonNullable<UsageResponse["extra_usage"]>;
+  return (
+    typeof candidate.is_enabled === "boolean" &&
+    typeof candidate.monthly_limit === "number" && Number.isFinite(candidate.monthly_limit) &&
+    typeof candidate.used_credits === "number" && Number.isFinite(candidate.used_credits) &&
+    typeof candidate.utilization === "number" && Number.isFinite(candidate.utilization) &&
+    typeof candidate.currency === "string"
+  );
 }
 
 async function fetchUsage(token: string): Promise<UsageResponse> {
-  const res = await fetch(USAGE_URL, {
+  const res = await request("Usage request", USAGE_URL, {
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
@@ -361,16 +458,20 @@ async function fetchUsage(token: string): Promise<UsageResponse> {
       "User-Agent": USER_AGENT,
     },
   });
-  if (!res.ok) {
-    throw new UsageHttpError(res.status, await res.text());
-  }
-  return res.json();
+  await requireOk("Usage request", res);
+  return parseUsage(await parseJsonResponse("Usage request", res));
 }
 
 // ---- Formatting -------------------------------------------------------------
+function clampPercent(value: number): number {
+  return Math.min(100, Math.max(0, value));
+}
+
 function countdown(iso: string | null): string {
   if (!iso) return "n/a";
-  const ms = new Date(iso).getTime() - Date.now();
+  const resetAt = Date.parse(iso);
+  if (!Number.isFinite(resetAt)) return "n/a";
+  const ms = resetAt - Date.now();
   if (ms <= 0) return "now";
   const h = Math.floor(ms / 3_600_000);
   const m = Math.floor((ms % 3_600_000) / 60_000);
@@ -385,14 +486,14 @@ function localTime(): string {
 }
 
 function bar(pctUsed: number, width = 20): string {
-  const filled = Math.round((pctUsed / 100) * width);
+  const filled = Math.round((clampPercent(pctUsed) / 100) * width);
   return "█".repeat(filled) + "░".repeat(Math.max(0, width - filled));
 }
 
 function line(label: string, w: Window | null): string {
   if (!w) return `${label.padEnd(16)} (not active)`;
-  const used = w.utilization;
-  const left = Math.max(0, 100 - used);
+  const used = clampPercent(w.utilization);
+  const left = 100 - used;
   return (
     `${label.padEnd(16)} ${bar(used)}  ${left.toFixed(0).padStart(3)}% left` +
     `  (used ${used.toFixed(0)}%)  resets in ${countdown(w.resets_at)}`
@@ -400,17 +501,62 @@ function line(label: string, w: Window | null): string {
 }
 
 // ---- Main -------------------------------------------------------------------
+interface Options {
+  forceLogin: boolean;
+  help: boolean;
+  mode: "full" | "short" | "json";
+}
+
+function parseOptions(args: string[]): Options {
+  let forceLogin = false;
+  let help = false;
+  let mode: Options["mode"] = "full";
+  let selectedMode: Options["mode"] | undefined;
+  for (const arg of args) {
+    if (arg === "--login") forceLogin = true;
+    else if (arg === "--help" || arg === "-h") help = true;
+    else if (arg === "--json") selectedMode = selectMode(selectedMode, "json");
+    else if (arg === "--short" || arg === "-s") selectedMode = selectMode(selectedMode, "short");
+    else if (arg === "full") selectedMode = selectMode(selectedMode, "full");
+    else throw new Error(`Unknown argument: ${arg}`);
+  }
+  if (selectedMode) mode = selectedMode;
+  return { forceLogin, help, mode };
+}
+
+function selectMode(current: Options["mode"] | undefined, next: Options["mode"]): Options["mode"] {
+  if (current && current !== next) {
+    throw new Error(`Output modes cannot be combined: ${current} and ${next}`);
+  }
+  return next;
+}
+
+function printHelp(): void {
+  console.log(`Usage: claude-quota [--login] [--short | --json]
+
+Options:
+  --login       Authorize again before requesting quota
+  --short, -s   Print a compact one-line summary
+  --json        Print the validated API response as JSON
+  --help, -h    Show this help`);
+}
+
 async function main() {
-  const wantJson = process.argv.includes("--json");
-  const wantShort = process.argv.includes("--short") || process.argv.includes("-s");
+  const options = parseOptions(process.argv.slice(2));
+  if (options.help) {
+    printHelp();
+    return;
+  }
   let oauth = await withCredentialLock(() =>
-    getValidToken(process.argv.includes("--login")),
+    getValidToken(options.forceLogin),
   );
   let usage: UsageResponse;
   try {
     usage = await fetchUsage(oauth.accessToken);
   } catch (err) {
-    if (!(err instanceof UsageHttpError) || err.status !== 401) throw err;
+    if (!(err instanceof HttpResponseError) || err.context !== "Usage request" || err.status !== 401) {
+      throw err;
+    }
     process.stderr.write("• access token rejected — refreshing and retrying once…\n");
     oauth = await withCredentialLock(async () => {
       try {
@@ -425,22 +571,22 @@ async function main() {
     usage = await fetchUsage(oauth.accessToken);
   }
 
-  if (wantJson) {
+  if (options.mode === "json") {
     console.log(JSON.stringify(usage, null, 2));
     return;
   }
 
-  if (wantShort) {
+  if (options.mode === "short") {
     const parts: string[] = [];
     if (usage.five_hour) {
       parts.push(
-        `5h:${Math.floor(Math.max(0, 100 - usage.five_hour.utilization))}% left ` +
+        `5h:${Math.floor(100 - clampPercent(usage.five_hour.utilization))}% left ` +
           `(${countdown(usage.five_hour.resets_at).replaceAll(" ", "")})`,
       );
     }
     if (usage.seven_day) {
       parts.push(
-        `7d:${Math.floor(Math.max(0, 100 - usage.seven_day.utilization))}% left ` +
+        `7d:${Math.floor(100 - clampPercent(usage.seven_day.utilization))}% left ` +
           `(${countdown(usage.seven_day.resets_at).replaceAll(" ", "")})`,
       );
     }
@@ -460,10 +606,11 @@ async function main() {
 
   const ex = usage.extra_usage;
   if (ex && ex.monthly_limit > 0) {
-    const left = Math.max(0, 100 - ex.utilization);
+    const utilization = clampPercent(ex.utilization);
+    const left = 100 - utilization;
     console.log("  " + "─".repeat(70));
     console.log(
-      `  extra usage      ${bar(ex.utilization)}  ${left.toFixed(0).padStart(3)}% left` +
+      `  extra usage      ${bar(utilization)}  ${left.toFixed(0).padStart(3)}% left` +
         `  (${ex.used_credits.toFixed(0)}/${ex.monthly_limit} ${ex.currency}` +
         `${ex.is_enabled ? "" : ", disabled: " + (ex.disabled_reason ?? "n/a")})`,
     );
