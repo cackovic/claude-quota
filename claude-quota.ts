@@ -31,9 +31,12 @@ import { join } from "node:path";
 import { createInterface } from "node:readline/promises";
 
 // ---- Constants (same endpoints Claude Code's /usage command uses) ----------
-const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
-const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
-const AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize";
+const USAGE_URL = process.env.CLAUDE_QUOTA_USAGE_URL
+  ?? "https://api.anthropic.com/api/oauth/usage";
+const TOKEN_URL = process.env.CLAUDE_QUOTA_TOKEN_URL
+  ?? "https://platform.claude.com/v1/oauth/token";
+const AUTHORIZE_URL = process.env.CLAUDE_QUOTA_AUTHORIZE_URL
+  ?? "https://claude.com/cai/oauth/authorize";
 const REDIRECT_URI = "https://platform.claude.com/oauth/code/callback";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; // Claude Code public OAuth client
 const OAUTH_BETA = "oauth-2025-04-20";
