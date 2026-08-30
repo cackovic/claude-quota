@@ -146,10 +146,10 @@ authorize() {
 
 # ---- get a valid access token (refresh if needed) --------------------------
 get_token() {
-  local blob exp now_ms
+  local force_refresh="${1:-false}" blob exp now_ms
   acquire_lock
   trap release_lock EXIT
-  if [[ "$mode" == "--login" ]]; then
+  if [[ "$mode" == "--login" && "$force_refresh" != "true" ]]; then
     authorize
     return
   fi
@@ -173,7 +173,7 @@ get_token() {
     || die "could not read credential expiry"
   now_ms=$(( $(date +%s) * 1000 ))
 
-  if (( now_ms < exp - REFRESH_SKEW_MS )); then
+  if [[ "$force_refresh" != "true" ]] && (( now_ms < exp - REFRESH_SKEW_MS )); then
     jq -er '.claudeAiOauth.accessToken' <<<"$blob" \
       || die "could not read access token"
     return
@@ -217,12 +217,31 @@ get_token() {
 }
 
 # ---- fetch usage -----------------------------------------------------------
+fetch_usage() {
+  local token="$1" response_file
+  response_file="$(mktemp "${TMPDIR:-/tmp}/claude-quota-usage.XXXXXX")"
+  USAGE_STATUS="$(curl -sS -o "$response_file" -w '%{http_code}' "$USAGE_URL" \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json" \
+    -H "anthropic-beta: $OAUTH_BETA" \
+    -H "User-Agent: $UA")" || {
+      rm -f "$response_file"
+      die "usage request failed"
+    }
+  USAGE="$(<"$response_file")"
+  rm -f "$response_file"
+}
+
 TOKEN="$(get_token)"
-USAGE="$(curl -sS "$USAGE_URL" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -H "anthropic-beta: $OAUTH_BETA" \
-  -H "User-Agent: $UA")" || die "usage request failed"
+USAGE=""
+USAGE_STATUS=""
+fetch_usage "$TOKEN"
+if [[ "$USAGE_STATUS" == "401" ]]; then
+  echo "• access token rejected — refreshing and retrying once…" >&2
+  TOKEN="$(get_token true)"
+  fetch_usage "$TOKEN"
+fi
+[[ "$USAGE_STATUS" == "200" ]] || die "usage fetch failed: HTTP $USAGE_STATUS $USAGE"
 
 jq -e 'has("five_hour")' <<<"$USAGE" >/dev/null 2>&1 || die "unexpected response: $USAGE"
 

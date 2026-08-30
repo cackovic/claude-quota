@@ -335,6 +335,12 @@ interface UsageResponse {
   [k: string]: unknown;
 }
 
+class UsageHttpError extends Error {
+  constructor(readonly status: number, body: string) {
+    super(`Usage fetch failed: HTTP ${status} ${body}`);
+  }
+}
+
 async function fetchUsage(token: string): Promise<UsageResponse> {
   const res = await fetch(USAGE_URL, {
     headers: {
@@ -345,7 +351,7 @@ async function fetchUsage(token: string): Promise<UsageResponse> {
     },
   });
   if (!res.ok) {
-    throw new Error(`Usage fetch failed: HTTP ${res.status} ${await res.text()}`);
+    throw new UsageHttpError(res.status, await res.text());
   }
   return res.json();
 }
@@ -378,10 +384,27 @@ function line(label: string, w: Window | null): string {
 // ---- Main -------------------------------------------------------------------
 async function main() {
   const wantJson = process.argv.includes("--json");
-  const oauth = await withCredentialLock(() =>
+  let oauth = await withCredentialLock(() =>
     getValidToken(process.argv.includes("--login")),
   );
-  const usage = await fetchUsage(oauth.accessToken);
+  let usage: UsageResponse;
+  try {
+    usage = await fetchUsage(oauth.accessToken);
+  } catch (err) {
+    if (!(err instanceof UsageHttpError) || err.status !== 401) throw err;
+    process.stderr.write("• access token rejected — refreshing and retrying once…\n");
+    oauth = await withCredentialLock(async () => {
+      try {
+        return await refresh(await readCreds());
+      } catch (refreshError) {
+        process.stderr.write(
+          `• refresh failed (${(refreshError as Error).message}) — authorizing again…\n`,
+        );
+        return authorize();
+      }
+    });
+    usage = await fetchUsage(oauth.accessToken);
+  }
 
   if (wantJson) {
     console.log(JSON.stringify(usage, null, 2));
