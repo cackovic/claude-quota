@@ -374,6 +374,13 @@ function countdown(iso: string | null): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
+function localTime(): string {
+  return new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date()).toLowerCase();
+}
+
 function bar(pctUsed: number, width = 20): string {
   const filled = Math.round((pctUsed / 100) * width);
   return "█".repeat(filled) + "░".repeat(Math.max(0, width - filled));
@@ -392,6 +399,7 @@ function line(label: string, w: Window | null): string {
 // ---- Main -------------------------------------------------------------------
 async function main() {
   const wantJson = process.argv.includes("--json");
+  const wantShort = process.argv.includes("--short") || process.argv.includes("-s");
   let oauth = await withCredentialLock(() =>
     getValidToken(process.argv.includes("--login")),
   );
@@ -419,7 +427,27 @@ async function main() {
     return;
   }
 
+  if (wantShort) {
+    const parts: string[] = [];
+    if (usage.five_hour) {
+      parts.push(
+        `5h:${Math.floor(Math.max(0, 100 - usage.five_hour.utilization))}% left ` +
+          `(${countdown(usage.five_hour.resets_at).replaceAll(" ", "")})`,
+      );
+    }
+    if (usage.seven_day) {
+      parts.push(
+        `7d:${Math.floor(Math.max(0, 100 - usage.seven_day.utilization))}% left ` +
+          `(${countdown(usage.seven_day.resets_at).replaceAll(" ", "")})`,
+      );
+    }
+    parts.push(`now ${localTime()}`);
+    console.log(parts.join("  ·  "));
+    return;
+  }
+
   console.log("\n  Claude Code quota");
+  console.log(`  Current Time: ${localTime()}`);
   console.log(`  plan: ${oauth.subscriptionType ?? "?"} (${oauth.rateLimitTier ?? "?"})`);
   console.log("  " + "─".repeat(70));
   console.log("  " + line("5-hour session", usage.five_hour));

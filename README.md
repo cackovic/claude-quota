@@ -59,11 +59,12 @@ Each window reports **% used**, **% left** (`100 − used`), and **when it reset
 git clone https://github.com/yehjxraymond/claude-quota
 cd claude-quota
 chmod +x claude-quota.sh
+npm install
 # optional: put it on your PATH
 ln -s "$PWD/claude-quota.sh" ~/.local/bin/claude-quota
 ```
 
-Dependencies: `curl`, `jq`, and `openssl`.
+Dependencies: Node.js 18+ and npm.
 
 ## Usage
 
@@ -74,9 +75,9 @@ claude-quota --short    # one line: 5h:83% left (2h21m)  ·  7d:85% left (3d10h)
 claude-quota --json     # raw API payload (for scripting)
 ```
 
-There's also a TypeScript equivalent (`claude-quota.ts`) if you prefer Node/Bun —
-run it with `bun claude-quota.ts`, `node claude-quota.ts` (Node 23+), or
-`npx tsx claude-quota.ts`.
+`claude-quota.ts` is the canonical implementation. `claude-quota.sh` is a small
+compatibility launcher that resolves the local `tsx` dependency and forwards all
+arguments, so both entry points always have identical behavior.
 
 Works on macOS and Linux/WSL. Authorization requires an interactive terminal
 once; subsequent quota checks and token refreshes are non-interactive.
