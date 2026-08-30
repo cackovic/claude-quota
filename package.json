@@ -3,8 +3,12 @@
   "version": "1.0.0",
   "description": "Query Claude Code subscription quota using independently authorized OAuth credentials.",
   "type": "module",
-  "engines": { "node": ">=18" },
-  "bin": { "claude-quota": "./claude-quota.ts" },
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "claude-quota": "./claude-quota.ts"
+  },
   "scripts": {
     "start": "tsx claude-quota.ts",
     "json": "tsx claude-quota.ts --json",
@@ -12,5 +16,9 @@
   },
   "dependencies": {
     "tsx": "^4.19.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "fsevents": false
   }
 }
