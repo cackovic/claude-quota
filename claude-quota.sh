@@ -6,80 +6,181 @@
 #   claude-quota.sh --short    one line: 5h:83% (2h21m)  7d:85% (3d10h)
 #   claude-quota.sh --json     raw API JSON
 #
-# Reuses the Claude Code CLI's stored OAuth token (macOS Keychain, or
-# ~/.claude/.credentials.json on Linux/WSL), refreshes it if expired, and calls
-# the same private endpoint the CLI's /usage command uses.
+# Authorizes independently with Claude, stores an app-specific OAuth token,
+# refreshes it if expired, and calls the same private endpoint the CLI's /usage
+# command uses.
 #
-# Deps: curl, jq.  macOS also uses `security` (Keychain).
+# Deps: curl, jq, openssl.
 
 set -euo pipefail
 
 USAGE_URL="https://api.anthropic.com/api/oauth/usage"
 TOKEN_URL="https://platform.claude.com/v1/oauth/token"
+AUTHORIZE_URL="https://claude.com/cai/oauth/authorize"
+REDIRECT_URI="https://platform.claude.com/oauth/code/callback"
 CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_BETA="oauth-2025-04-20"
-SERVICE="Claude Code-credentials"
+SCOPES="user:inference user:profile user:sessions:claude_code user:mcp_servers user:file_upload"
 UA="claude-cli/2.1.185 (external, cli)"
-CRED_FILE="$HOME/.claude/.credentials.json"
+CONFIG_DIR="${CLAUDE_QUOTA_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-quota}"
+CRED_FILE="$CONFIG_DIR/credentials.json"
 REFRESH_SKEW_MS=60000   # refresh if it expires within a minute
 
 die() { echo "Error: $*" >&2; exit 1; }
 command -v jq   >/dev/null || die "jq not found"
 command -v curl >/dev/null || die "curl not found"
+command -v openssl >/dev/null || die "openssl not found"
+
+mode="${1:-full}"
+case "$mode" in
+  full|""|--short|-s|--json|--login) ;;
+  *) die "unknown option: $mode (use --login, --short, --json, or no arg)" ;;
+esac
 
 # ---- credential read/write -------------------------------------------------
 read_blob() {
-  if [[ "$(uname)" == "Darwin" ]]; then
-    security find-generic-password -s "$SERVICE" -w 2>/dev/null \
-      || die "no Keychain item '$SERVICE' (is Claude Code logged in?)"
-  else
-    [[ -f "$CRED_FILE" ]] || die "no credentials at $CRED_FILE"
-    cat "$CRED_FILE"
-  fi
+  [[ -f "$CRED_FILE" ]] || return 1
+  cat "$CRED_FILE"
 }
 
 write_blob() {  # $1 = full JSON blob
-  if [[ "$(uname)" == "Darwin" ]]; then
-    security add-generic-password -U -s "$SERVICE" -a "$USER" -w "$1"
-  else
-    umask 177; printf '%s' "$1" > "$CRED_FILE"
+  mkdir -p -m 700 "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+  umask 177
+  printf '%s' "$1" > "$CRED_FILE"
+  chmod 600 "$CRED_FILE"
+}
+
+# ---- independent OAuth authorization (authorization code + PKCE) ----------
+authorize() {
+  [[ -t 0 || -r /dev/tty ]] || die "authorization requires an interactive terminal"
+
+  local verifier challenge state query auth_url pasted code returned_state
+  local resp token_json access refresh expires_in expires_at scope blob now_ms reason
+  verifier="$(openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '=')"
+  challenge="$(printf '%s' "$verifier" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')"
+  state="$(openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '=')"
+  query="$(jq -rn \
+    --arg cid "$CLIENT_ID" --arg redirect "$REDIRECT_URI" --arg scopes "$SCOPES" \
+    --arg challenge "$challenge" --arg state "$state" \
+    '"code=true&client_id=\($cid|@uri)&response_type=code&redirect_uri=\($redirect|@uri)&scope=\($scopes|@uri)&code_challenge=\($challenge|@uri)&code_challenge_method=S256&state=\($state|@uri)"')" \
+    || die "could not construct authorization URL"
+  auth_url="$AUTHORIZE_URL?$query"
+
+  printf '\nAuthorize claude-quota in Claude:\n\n%s\n\n' "$auth_url" >&2
+  printf 'After approving, copy the code shown by Claude.\n' >&2
+  printf 'Paste authorization code: ' >&2
+  IFS= read -r pasted </dev/tty
+  [[ -n "$pasted" ]] || die "no authorization code supplied"
+  code="${pasted%%#*}"
+  returned_state=""
+  [[ "$pasted" == *#* ]] && returned_state="${pasted#*#}"
+  [[ -z "$returned_state" || "$returned_state" == "$state" ]] \
+    || die "authorization state mismatch; refusing to exchange the code"
+
+  resp="$(curl -sS -X POST "$TOKEN_URL" \
+    -H "Content-Type: application/json" \
+    -H "anthropic-beta: $OAUTH_BETA" \
+    -H "User-Agent: $UA" \
+    -d "$(jq -n --arg code "$code" --arg state "$state" --arg cid "$CLIENT_ID" \
+      --arg redirect "$REDIRECT_URI" --arg verifier "$verifier" \
+      '{grant_type:"authorization_code",code:$code,state:$state,client_id:$cid,redirect_uri:$redirect,code_verifier:$verifier}')")" \
+    || die "authorization request failed"
+  if ! token_json="$(jq -ce '
+      select((.access_token | type) == "string" and (.access_token | length) > 0)
+      | select((.refresh_token | type) == "string" and (.refresh_token | length) > 0)
+      | select((.expires_in | type) == "number" and .expires_in > 0)
+    ' <<<"$resp" 2>/dev/null)"; then
+    reason="$(jq -r '.error.message // "invalid token response"' <<<"$resp" 2>/dev/null \
+      || printf 'invalid token response')"
+    die "authorization failed: $reason"
   fi
+  access="$(jq -r '.access_token' <<<"$token_json")" || die "could not read access token"
+  refresh="$(jq -r '.refresh_token' <<<"$token_json")" || die "could not read refresh token"
+  expires_in="$(jq -r '.expires_in' <<<"$token_json")" || die "could not read token expiry"
+  scope="$(jq -r --arg fallback "$SCOPES" '
+    if (.scope | type) == "string" then .scope
+    elif (.scope | type) == "array" then (.scope | join(" "))
+    else $fallback end
+  ' <<<"$token_json")" || die "could not read token scopes"
+  now_ms=$(( $(date +%s) * 1000 ))
+  expires_at=$(( now_ms + expires_in * 1000 ))
+  blob="$(jq -n --arg at "$access" --arg rt "$refresh" --argjson exp "$expires_at" \
+    --arg scope "$scope" \
+    '{claudeAiOauth:{accessToken:$at,refreshToken:$rt,expiresAt:$exp,scopes:($scope|split(" "))}}')" \
+    || die "could not construct credential record"
+  write_blob "$blob" || die "could not save claude-quota credentials"
+  printf 'Authorization saved for claude-quota.\n' >&2
+  printf '%s' "$access"
 }
 
 # ---- get a valid access token (refresh if needed) --------------------------
 get_token() {
   local blob exp now_ms
-  blob="$(read_blob)"
-  exp="$(jq -r '.claudeAiOauth.expiresAt // 0' <<<"$blob")"
+  if [[ "$mode" == "--login" ]]; then
+    authorize
+    return
+  fi
+  if ! blob="$(read_blob)"; then
+    authorize
+    return
+  fi
+  if ! jq -e '
+      (.claudeAiOauth | type) == "object"
+      and (.claudeAiOauth.accessToken | type) == "string"
+      and (.claudeAiOauth.accessToken | length) > 0
+      and (.claudeAiOauth.refreshToken | type) == "string"
+      and (.claudeAiOauth.refreshToken | length) > 0
+      and (.claudeAiOauth.expiresAt | type) == "number"
+    ' <<<"$blob" >/dev/null 2>&1; then
+    echo "• stored claude-quota credentials are invalid — authorizing again…" >&2
+    authorize
+    return
+  fi
+  exp="$(jq -er '.claudeAiOauth.expiresAt' <<<"$blob")" \
+    || die "could not read credential expiry"
   now_ms=$(( $(date +%s) * 1000 ))
 
   if (( now_ms < exp - REFRESH_SKEW_MS )); then
-    jq -r '.claudeAiOauth.accessToken' <<<"$blob"
+    jq -er '.claudeAiOauth.accessToken' <<<"$blob" \
+      || die "could not read access token"
     return
   fi
 
   echo "• access token expired — refreshing…" >&2
-  local refresh resp access new_refresh expires_in new_exp new_blob
-  refresh="$(jq -r '.claudeAiOauth.refreshToken' <<<"$blob")"
+  local refresh resp token_json access new_refresh expires_in new_exp new_blob reason
+  refresh="$(jq -er '.claudeAiOauth.refreshToken' <<<"$blob")" \
+    || die "could not read refresh token"
   resp="$(curl -sS -X POST "$TOKEN_URL" \
     -H "Content-Type: application/json" \
     -H "anthropic-beta: $OAUTH_BETA" \
     -H "User-Agent: $UA" \
     -d "$(jq -n --arg rt "$refresh" --arg cid "$CLIENT_ID" \
-            '{grant_type:"refresh_token",refresh_token:$rt,client_id:$cid}')")"
+            '{grant_type:"refresh_token",refresh_token:$rt,client_id:$cid}')")" \
+    || die "token refresh request failed"
 
-  access="$(jq -r '.access_token // empty' <<<"$resp")"
-  [[ -n "$access" ]] || die "refresh failed: $resp"
-  new_refresh="$(jq -r '.refresh_token // empty' <<<"$resp")"
+  if ! token_json="$(jq -ce '
+      select((.access_token | type) == "string" and (.access_token | length) > 0)
+      | select((.expires_in | type) == "number" and .expires_in > 0)
+    ' <<<"$resp" 2>/dev/null)"; then
+    reason="$(jq -r '.error.message // "invalid token response"' <<<"$resp" 2>/dev/null \
+      || printf 'invalid token response')"
+    echo "• token refresh failed ($reason) — authorizing again…" >&2
+    authorize
+    return
+  fi
+  access="$(jq -r '.access_token' <<<"$token_json")" || die "could not read refreshed access token"
+  new_refresh="$(jq -r '.refresh_token // empty' <<<"$token_json")" \
+    || die "could not read rotated refresh token"
   [[ -n "$new_refresh" ]] || new_refresh="$refresh"   # fall back if not rotated
-  expires_in="$(jq -r '.expires_in // 0' <<<"$resp")"
+  expires_in="$(jq -r '.expires_in' <<<"$token_json")" || die "could not read refreshed expiry"
   new_exp=$(( now_ms + expires_in * 1000 ))
 
-  # merge rotated tokens back into the full blob (preserves mcpOAuth etc.)
+  # Update only claude-quota's app-specific credential blob.
   new_blob="$(jq --arg at "$access" --arg rt "$new_refresh" --argjson exp "$new_exp" \
     '.claudeAiOauth.accessToken=$at | .claudeAiOauth.refreshToken=$rt | .claudeAiOauth.expiresAt=$exp' \
-    <<<"$blob")"
-  write_blob "$new_blob"
+    <<<"$blob")" || die "could not update stored credentials"
+  write_blob "$new_blob" || die "could not save refreshed credentials"
   printf '%s' "$access"
 }
 
@@ -89,7 +190,7 @@ USAGE="$(curl -sS "$USAGE_URL" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "anthropic-beta: $OAUTH_BETA" \
-  -H "User-Agent: $UA")"
+  -H "User-Agent: $UA")" || die "usage request failed"
 
 jq -e 'has("five_hour")' <<<"$USAGE" >/dev/null 2>&1 || die "unexpected response: $USAGE"
 
@@ -104,7 +205,6 @@ JQ_HELPERS='
 '
 
 # ---- output modes ----------------------------------------------------------
-mode="${1:-full}"
 NOW_STR="$(date '+%-I:%M %p' | tr 'A-Z' 'a-z')"   # e.g. "11:06 pm" (local machine time)
 case "$mode" in
   --json)
@@ -117,7 +217,7 @@ case "$mode" in
         "now \($now)"
       ] | join("  ·  ")' <<<"$USAGE" ;;
 
-  full|"")
+  full|""|--login)
     jq -r --arg now "$NOW_STR" "$JQ_HELPERS"'
       def bar(u): (u/5|floor) as $f | ("█"*$f) + ("░"*(20-$f));
       def row(lbl;w): if w==null then "  \(lbl|.+" "*(16-length))(not active)"
@@ -131,5 +231,4 @@ case "$mode" in
       (if .seven_day_sonnet then row("7-day Sonnet"; .seven_day_sonnet) else empty end),
       ""' <<<"$USAGE" ;;
 
-  *) die "unknown option: $mode (use --short, --json, or no arg)" ;;
 esac

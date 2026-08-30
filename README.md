@@ -63,11 +63,12 @@ chmod +x claude-quota.sh
 ln -s "$PWD/claude-quota.sh" ~/.local/bin/claude-quota
 ```
 
-Dependencies: `curl` and `jq` (plus `security`, built in on macOS).
+Dependencies: `curl`, `jq`, and `openssl`.
 
 ## Usage
 
 ```bash
+claude-quota --login    # authorize this app with Claude (also happens on first run)
 claude-quota            # full readable report
 claude-quota --short    # one line: 5h:83% left (2h21m)  ·  7d:85% left (3d10h)  ·  now 11:07 pm
 claude-quota --json     # raw API payload (for scripting)
@@ -77,7 +78,8 @@ There's also a TypeScript equivalent (`claude-quota.ts`) if you prefer Node/Bun 
 run it with `bun claude-quota.ts`, `node claude-quota.ts` (Node 23+), or
 `npx tsx claude-quota.ts`.
 
-Works on macOS (Keychain) and Linux/WSL (`~/.claude/.credentials.json`).
+Works on macOS and Linux/WSL. Authorization requires an interactive terminal
+once; subsequent quota checks and token refreshes are non-interactive.
 
 ---
 
@@ -85,7 +87,17 @@ Works on macOS (Keychain) and Linux/WSL (`~/.claude/.credentials.json`).
 
 Claude Code's own `/usage` command (aliases `/cost`, `/stats`) reads your
 subscription limits from an internal endpoint. This tool calls the same one,
-using the OAuth token Claude Code already stores on your machine.
+but performs its own OAuth authorization-code flow with PKCE and maintains a
+separate credential. It never reads or changes Claude Code's stored token.
+
+On first run, the CLI prints a Claude authorization URL. Open it, approve access,
+then paste the code shown by Claude back into the terminal. Use `--login` at any
+time to authorize again or switch accounts.
+
+The pasted value must be the one-time authorization code shown after browser
+approval (sometimes formatted as `code#state`), not an `sk-ant-api...` Console
+API key. If stored credentials are malformed or their refresh token is rejected,
+the CLI automatically starts this authorization flow again.
 
 ### The endpoint
 
@@ -129,17 +141,17 @@ Key points:
 - `extra_usage` / `spend` describe the optional paid overage pool, not the
   subscription windows.
 
-### Getting / refreshing the token
+### Authorizing / refreshing the token
 
-Claude Code authenticates with **OAuth 2.0**. The access token is short-lived and
-must be refreshed.
+The tool uses **OAuth 2.0 authorization code with PKCE**. It generates a new
+verifier, challenge, and state for each login, then exchanges the one-time code
+for its own access and refresh tokens. The access token is short-lived and is
+refreshed automatically.
 
 **Where it's stored**
-- **macOS:** login Keychain, generic password, service `Claude Code-credentials`.
-  ```bash
-  security find-generic-password -s "Claude Code-credentials" -w
-  ```
-- **Linux / WSL:** `~/.claude/.credentials.json`.
+- **All platforms:** `${XDG_CONFIG_HOME:-~/.config}/claude-quota/credentials.json`
+  with mode `0600` in a mode-`0700` directory. Set
+  `CLAUDE_QUOTA_CONFIG_DIR` to override the directory.
 
 The credential JSON:
 ```jsonc
@@ -152,7 +164,6 @@ The credential JSON:
     "subscriptionType": "max",
     "rateLimitTier":    "default_claude_max_5x"
   },
-  "mcpOAuth": { ... }                     // sibling — preserved on write
 }
 ```
 
@@ -171,8 +182,8 @@ Response: `{ access_token, refresh_token, expires_in (seconds), scope }`.
 - `client_id` `9d1c250a-e61b-44d9-88ed-5944d1962f5e` is Claude Code's public
   OAuth client.
 - The refresh **rotates the refresh token** — the tool writes the new
-  `access_token` + `refresh_token` + recomputed `expiresAt` back to the Keychain
-  (preserving sibling keys like `mcpOAuth`) so the real CLI keeps working.
+  `access_token` + `refresh_token` + recomputed `expiresAt` back to its own
+  app-specific config file. Claude Code's credential is untouched.
 - The refresh endpoint is **rate-limited**; the tool refreshes lazily, only near
   expiry (60s skew).
 
@@ -184,11 +195,11 @@ Response: `{ access_token, refresh_token, expires_in (seconds), scope }`.
 |---|---|
 | Usage endpoint | `GET https://api.anthropic.com/api/oauth/usage` |
 | Token refresh | `POST https://platform.claude.com/v1/oauth/token` |
-| OAuth authorize | `https://platform.claude.com/oauth/authorize` |
+| OAuth authorize | `https://claude.com/cai/oauth/authorize` |
 | OAuth client_id | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
 | Beta header | `anthropic-beta: oauth-2025-04-20` |
-| Keychain service (macOS) | `Claude Code-credentials` |
-| Cred file (Linux/WSL) | `~/.claude/.credentials.json` |
+| Redirect URI | `https://platform.claude.com/oauth/code/callback` |
+| Credential file | `${XDG_CONFIG_HOME:-~/.config}/claude-quota/credentials.json` |
 | 5-hour quota field | `five_hour.utilization` (% used), `five_hour.resets_at` |
 | Weekly quota field | `seven_day.utilization` (% used), `seven_day.resets_at` |
 | % left | `100 - utilization` |
@@ -197,6 +208,8 @@ Response: `{ access_token, refresh_token, expires_in (seconds), scope }`.
 
 - This uses an **internal, undocumented endpoint** — Anthropic can change it
   without notice and it may stop working.
+- The authorization flow uses Claude Code's public OAuth client identifier;
+  Anthropic does not document this as a supported third-party integration.
 - Use only with your own account/credentials.
 - The endpoint reflects subscription rate-limit windows; the dollar/overage
   fields apply only if you've enabled pay-as-you-go usage.

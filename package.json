@@ -1,7 +1,7 @@
 {
   "name": "claude-quota",
   "version": "1.0.0",
-  "description": "Query Claude Code 5-hour and weekly subscription quota from the CLI's OAuth credentials.",
+  "description": "Query Claude Code subscription quota using independently authorized OAuth credentials.",
   "type": "module",
   "bin": { "claude-quota": "./claude-quota.ts" },
   "scripts": {
